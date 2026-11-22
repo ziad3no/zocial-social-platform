@@ -1,6 +1,6 @@
 # Database and schema notes
 
-Zocial stores everything in one SQLite file (`data/zocial.db`) through Node's built-in `node:sqlite` module. Uploaded images live in the same file as BLOBs. That keeps backups to a single file and means there are no upload folders whose paths could be abused. The schema is in [`server/db.ts`](../server/db.ts) and is created on start-up with `CREATE TABLE IF NOT EXISTS`.
+Zocial stores everything in PostgreSQL: a free Supabase database in production, and PGlite (Postgres compiled to WebAssembly) on your computer and in the tests, so both run the same SQL. Uploaded images live in the database as `BYTEA`. That keeps backups to one database and means there are no upload folders whose paths could be abused. The schema is in [`server/db.ts`](../server/db.ts) and is created on start-up with `CREATE TABLE IF NOT EXISTS`.
 
 ## Entity relationship diagram
 
@@ -36,7 +36,7 @@ erDiagram
     INTEGER id PK
     INTEGER owner_id FK
     TEXT mime "jpeg, png, webp or gif"
-    BLOB bytes
+    BYTEA bytes
     INTEGER size
     TEXT created_at
   }
@@ -71,7 +71,7 @@ erDiagram
 | Column | Type | Rules |
 | --- | --- | --- |
 | `id` | INTEGER | Primary key |
-| `username` | TEXT | Unique, `COLLATE NOCASE` so `Nour` and `nour` can't both exist. The app also lowercases it and allows only `a-z`, `0-9` and `_`, 3 to 20 characters. |
+| `username` | TEXT | Unique. The app lowercases it before saving, so `Nour` and `nour` can't both exist, and allows only `a-z`, `0-9` and `_`, 3 to 20 characters. |
 | `display_name` | TEXT | 2 to 40 characters |
 | `bio` | TEXT | Up to 160 characters, empty by default |
 | `avatar_media_id` | INTEGER | Points to `media.id`. `ON DELETE SET NULL`, so a missing photo falls back to initials. |
@@ -120,7 +120,7 @@ ON CONFLICT (post_id, user_id) DO UPDATE SET type = excluded.type;
 | A comment | Nothing else |
 | A media row | Any post or avatar pointing to it gets NULL (SET NULL) |
 
-Foreign keys are only enforced in SQLite when `PRAGMA foreign_keys = ON` is set, which `openDb()` does for every connection.
+`users.avatar_media_id` and `media.owner_id` point at each other, so the avatar foreign key is added in a separate step after both tables exist. Schema creation and seeding run inside a transaction holding a Postgres advisory lock, so two serverless instances starting at the same moment can't create tables or seed twice.
 
 ## Indexes and the queries they serve
 

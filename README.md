@@ -2,7 +2,7 @@
 
 Zocial is a full-stack social app for a small community. Members have profiles, write posts with an optional photo, react with one of five emoji, and talk in the comments. The server makes sure nobody can edit or delete someone else's content, and every list handles loading, empty and error states.
 
-- **Live demo:** [ADD: your Render URL, e.g. https://zocial.onrender.com]
+- **Live demo:** [ADD: your Vercel URL, e.g. https://zocial.vercel.app]
 - **Demo video:** [ADD: YouTube or LinkedIn link]
 
 On the live demo, pick one of the **Try a demo account** members on the sign-in page. Sign in as two different members (one in a private window) to see the ownership rules in action.
@@ -56,7 +56,7 @@ The app also follows the system dark mode.
 
 ## Getting started
 
-You need Node.js 22.13 or newer (24 recommended). There is no database server to install: Zocial uses the SQLite engine built into Node.
+You need Node.js 22.13 or newer (24 recommended). There is no database server to install: locally Zocial runs PGlite, a full Postgres that ships as an npm package.
 
 ```bash
 git clone https://github.com/ziad3no/zocial-social-platform.git
@@ -65,7 +65,7 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5175. The first start creates `data/zocial.db` with eight demo members, 38 posts, comments and reactions. Pick a demo member on the sign-in page, or create your own account.
+Open http://localhost:5175. The first start creates a local Postgres database in `data/pglite` with eight demo members, 38 posts, comments and reactions. Pick a demo member on the sign-in page, or create your own account.
 
 To run the production build locally:
 
@@ -90,21 +90,25 @@ All optional. Copy `.env.example` to `.env` to change them. None of them is a se
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PORT` | `3002` | Port in production. Render sets it for you. |
+| `DATABASE_URL` or `POSTGRES_URL` | not set | Postgres connection string. On Vercel the Supabase integration sets `POSTGRES_URL`. When neither is set, a local PGlite database is used. |
+| `PORT` | `3002` | Port for `npm start`. |
 | `API_PORT` | `3002` | Port the API uses during `npm run dev` |
-| `DATA_DIR` | `./data` | Folder for the SQLite file (images are stored inside it) |
+| `DATA_DIR` | `./data` | Folder for the local PGlite database (images are stored inside it) |
 | `DEMO_LOGIN` | `true` | Show the demo members on the sign-in page |
-| `DEMO_RESET_HOURS` | `0` | Wipe and re-seed every N hours. The Render blueprint uses 6. |
+| `DEMO_RESET_HOURS` | `0` locally, `24` on Vercel | Wipe and re-seed the demo data when it is older than N hours. |
 
 ## Deploying
 
-### Render (free)
+### Vercel + Supabase (free, no card)
+
+The React app is served by Vercel, the API runs as a Vercel serverless function (`api/index.ts`, routed by `vercel.json`), and the data lives in a free Supabase Postgres database.
 
 1. Push this repository to GitHub.
-2. On [Render](https://render.com), choose **New → Blueprint** and select the repository. Render reads `render.yaml`.
-3. Wait for the first build (about three minutes). The URL appears at the top of the service page.
+2. On [Vercel](https://vercel.com), choose **Add New → Project** and import the repository. Keep the detected settings and deploy.
+3. In the Vercel project, open **Storage → Connect Database → Supabase** and create a free database. Vercel adds `POSTGRES_URL` and the other connection settings to the project for you, so no password is copied by hand.
+4. Redeploy. The first request creates the tables and loads the demo data.
 
-The free plan sleeps after 15 minutes without traffic, so the first visit after a pause takes up to a minute. Its disk is also temporary, so posts and uploads go back to the demo data on every restart or redeploy. That suits a public demo. For real use, attach a persistent disk and point `DATA_DIR` at it.
+The public demo resets to the demo data every 24 hours (`DEMO_RESET_HOURS`). Supabase pauses a free project after a week without visits; it can be resumed from the Supabase dashboard.
 
 ### Docker
 
@@ -112,6 +116,10 @@ The free plan sleeps after 15 minutes without traffic, so the first visit after 
 docker build -t zocial .
 docker run -p 3000:3000 -v zocial-data:/data zocial
 ```
+
+Without a database URL the container uses PGlite and keeps its data in the `/data` volume. Set `DATABASE_URL` to use an external Postgres instead.
+
+Without a database URL the container uses PGlite and keeps its data in the `/data` volume. Set `DATABASE_URL` to use an external Postgres instead.
 
 ## How it works
 
@@ -127,12 +135,12 @@ flowchart LR
     API --> R["shared/rules.ts<br/>who can edit/delete"]
     API --> Z["shared/schemas.ts<br/>Zod validation"]
     API --> S[Check file bytes]
-    API --> DB[(SQLite: users, posts,<br/>comments, reactions, media)]
+    API --> DB[(PostgreSQL: users, posts,<br/>comments, reactions, media)]
   end
 ```
 
 - **Client:** React 19, React Router 7 and TanStack Query, built with Vite. A post can appear in several lists at once (the feed, a profile, its own page). Edits, deletes and reactions update every cached copy, so the screens stay in sync without refetching.
-- **Server:** Express 5, `node:sqlite`, Multer for uploads. Every query uses bound parameters.
+- **Server:** Express 5, PostgreSQL (Supabase in production, PGlite locally and in the tests), Multer for uploads. Every query uses bound parameters.
 - **Shared:** `shared/` holds the authorization rules, the validation rules and the response types. The browser uses the same rules to decide what to show, and the server uses them to decide what to allow.
 
 The data model, delete rules, indexes and the reasoning behind cursor pagination are in [docs/database.md](docs/database.md).
@@ -165,8 +173,11 @@ Lists return `{ "items": [...], "nextCursor": "..." }`. `nextCursor` is `null` o
 ### Project structure
 
 ```
+api/
+  index.ts                Vercel serverless entry point
 server/
-  index.ts                start-up: open the database, seed, listen
+  index.ts                local start-up: open the database, seed, listen
+  config.ts               settings from environment variables
   app.ts                  Express app (also used by the tests)
   auth.ts                 password hashing, sessions, CSRF header check, sign-in limiter
   db.ts                   schema, transactions, cursor encoding

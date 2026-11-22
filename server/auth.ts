@@ -2,7 +2,7 @@ import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto'
 import { promisify } from 'node:util'
 import type { RequestHandler, Response } from 'express'
 import type { SessionUser } from '../shared/types'
-import type { DB } from './db'
+import type { Queryable } from './db'
 import { forbidden, HttpError } from './http'
 
 const scryptAsync = promisify(scrypt) as (pw: string, salt: Buffer, keylen: number) => Promise<Buffer>
@@ -44,16 +44,16 @@ export const NO_PASSWORD = '!'
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex')
 
 /** Creates a session and returns the raw token. Only its hash is stored. */
-export function createSession(db: DB, userId: number): string {
+export async function createSession(db: Queryable, userId: number): Promise<string> {
   const token = randomBytes(32).toString('base64url')
   const now = new Date()
   const expires = new Date(now.getTime() + SESSION_DAYS * 86_400_000)
-  db.prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)').run(
+  await db.run('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)', [
     sha256(token),
     userId,
     now.toISOString(),
     expires.toISOString(),
-  )
+  ])
   return token
 }
 
@@ -77,7 +77,7 @@ export interface UserRecord {
   display_name: string
   bio: string
   avatar_media_id: number | null
-  is_demo: number
+  is_demo: boolean
   password_hash: string
 }
 
@@ -89,19 +89,19 @@ export const toSessionUser = (u: UserRecord): SessionUser => ({
   displayName: u.display_name,
   bio: u.bio,
   avatarUrl: avatarUrl(u.avatar_media_id),
-  isDemo: u.is_demo === 1,
+  isDemo: u.is_demo === true,
 })
 
 /** Reads the session cookie and attaches req.user. Never fails the request. */
-export function loadUser(db: DB): RequestHandler {
-  const find = db.prepare(`
+export function loadUser(db: Queryable): RequestHandler {
+  const sql = `
     SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token_hash = ? AND s.expires_at > ?`)
-  return (req, _res, next) => {
+    WHERE s.token_hash = ? AND s.expires_at > ?`
+  return async (req, _res, next) => {
     const token = req.cookies?.[SESSION_COOKIE]
     if (typeof token === 'string' && token.length > 0 && token.length < 200) {
       const hash = sha256(token)
-      const row = find.get(hash, new Date().toISOString()) as UserRecord | undefined
+      const row = await db.get<UserRecord>(sql, [hash, new Date().toISOString()])
       if (row) {
         req.user = toSessionUser(row)
         req.sessionHash = hash

@@ -7,6 +7,7 @@ import type { AppConfig, UserSummary } from '../shared/types'
 import { avatarUrl, loadUser, requireCsrfHeader } from './auth'
 import type { DB } from './db'
 import { errorHandler, notFound } from './http'
+import { demoResetter } from './seed'
 import { mediaRoutes } from './media'
 import { authRoutes, meRoutes, userRoutes } from './routes/auth'
 import { commentRoutes, postRoutes } from './routes/posts'
@@ -15,6 +16,8 @@ export interface AppOptions {
   demoLogin: boolean
   secureCookies: boolean
   clientDir?: string
+  /** Wipe and re-seed the demo data when it is older than this many hours (0 = never). */
+  demoResetHours?: number
 }
 
 export function createApp(db: DB, options: AppOptions) {
@@ -27,16 +30,21 @@ export function createApp(db: DB, options: AppOptions) {
 
   const api = express.Router()
   api.use(requireCsrfHeader)
+  const maybeReset = demoResetter(db, options.demoResetHours ?? 0)
+  api.use(async (_req, _res, next) => {
+    await maybeReset()
+    next()
+  })
   api.use(loadUser(db))
   api.get('/health', (_req, res) => {
     res.json({ ok: true })
   })
-  api.get('/config', (_req, res) => {
+  api.get('/config', async (_req, res) => {
     let demoAccounts: UserSummary[] = []
     if (options.demoLogin) {
-      const rows = db
-        .prepare('SELECT id, username, display_name, avatar_media_id FROM users WHERE is_demo = 1 ORDER BY id LIMIT 3')
-        .all() as { id: number; username: string; display_name: string; avatar_media_id: number | null }[]
+      const rows = await db.all<{ id: number; username: string; display_name: string; avatar_media_id: number | null }>(
+        'SELECT id, username, display_name, avatar_media_id FROM users WHERE is_demo ORDER BY id LIMIT 3',
+      )
       demoAccounts = rows.map((r) => ({ id: r.id, username: r.username, displayName: r.display_name, avatarUrl: avatarUrl(r.avatar_media_id) }))
     }
     const config: AppConfig = { demoLogin: options.demoLogin, demoAccounts }

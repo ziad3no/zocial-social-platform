@@ -3,7 +3,7 @@ import { canDeleteComment, canDeletePost, canEditComment, canEditPost, type View
 import { REACTIONS, type Reaction } from '../shared/schemas'
 import type { CommentView, PostView, UserSummary } from '../shared/types'
 import { avatarUrl } from './auth'
-import { decodeCursor, encodeCursor, type DB } from './db'
+import { decodeCursor, encodeCursor, type Queryable } from './db'
 
 interface PostRecord {
   id: number
@@ -22,7 +22,7 @@ interface PostRecord {
 const POST_SELECT = `
   SELECT p.id, p.author_id, p.body, p.media_id, p.created_at, p.edited_at,
          u.username, u.display_name, u.avatar_media_id,
-         (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count,
+         (SELECT COUNT(*)::int FROM comments c WHERE c.post_id = p.id) AS comment_count,
          (SELECT r.type FROM reactions r WHERE r.post_id = p.id AND r.user_id = ?) AS my_reaction
   FROM posts p JOIN users u ON u.id = p.author_id`
 
@@ -37,13 +37,14 @@ function emptyReactions(): Record<Reaction, number> {
   return Object.fromEntries(REACTIONS.map((r) => [r, 0])) as Record<Reaction, number>
 }
 
-function toPostViews(db: DB, viewer: Viewer, rows: PostRecord[]): PostView[] {
+async function toPostViews(db: Queryable, viewer: Viewer, rows: PostRecord[]): Promise<PostView[]> {
   const counts = new Map<number, Record<Reaction, number>>()
   if (rows.length) {
     const ids = rows.map((r) => r.id)
-    const agg = db
-      .prepare(`SELECT post_id, type, COUNT(*) AS n FROM reactions WHERE post_id IN (${ids.map(() => '?').join(',')}) GROUP BY post_id, type`)
-      .all(...ids) as { post_id: number; type: Reaction; n: number }[]
+    const agg = await db.all<{ post_id: number; type: Reaction; n: number }>(
+      `SELECT post_id, type, COUNT(*)::int AS n FROM reactions WHERE post_id IN (${ids.map(() => '?').join(',')}) GROUP BY post_id, type`,
+      ids,
+    )
     for (const row of agg) {
       const entry = counts.get(row.post_id) ?? emptyReactions()
       entry[row.type] = row.n
@@ -65,26 +66,27 @@ function toPostViews(db: DB, viewer: Viewer, rows: PostRecord[]): PostView[] {
   }))
 }
 
-export function getPostView(db: DB, viewer: Viewer, id: number): PostView | null {
-  const row = db.prepare(`${POST_SELECT} WHERE p.id = ?`).get(viewer.id, id) as PostRecord | undefined
-  return row ? toPostViews(db, viewer, [row])[0]! : null
+export async function getPostView(db: Queryable, viewer: Viewer, id: number): Promise<PostView | null> {
+  const row = await db.get<PostRecord>(`${POST_SELECT} WHERE p.id = ?`, [viewer.id, id])
+  return row ? (await toPostViews(db, viewer, [row]))[0]! : null
 }
 
 /** Newest first. Pass the previous nextCursor to continue. */
-export function listPosts(db: DB, viewer: Viewer, opts: { cursor?: string; limit: number; authorId?: number }) {
+export async function listPosts(db: Queryable, viewer: Viewer, opts: { cursor?: string; limit: number; authorId?: number }) {
   const where: string[] = []
   const params: (string | number)[] = [viewer.id]
   if (opts.authorId) (where.push('p.author_id = ?'), params.push(opts.authorId))
   const cursor = decodeCursor(opts.cursor)
   if (cursor) (where.push('(p.created_at, p.id) < (?, ?)'), params.push(cursor.createdAt, cursor.id))
-  const rows = db
-    .prepare(`${POST_SELECT} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY p.created_at DESC, p.id DESC LIMIT ?`)
-    .all(...params, opts.limit + 1) as unknown as PostRecord[]
+  const rows = await db.all<PostRecord>(
+    `${POST_SELECT} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY p.created_at DESC, p.id DESC LIMIT ?`,
+    [...params, opts.limit + 1],
+  )
   const hasMore = rows.length > opts.limit
   const page = rows.slice(0, opts.limit)
   const last = page.at(-1)
   return {
-    items: toPostViews(db, viewer, page),
+    items: await toPostViews(db, viewer, page),
     nextCursor: hasMore && last ? encodeCursor(last.created_at, last.id) : null,
   }
 }
@@ -118,17 +120,17 @@ const toCommentView = (viewer: Viewer, r: CommentRecord): CommentView => ({
   canDelete: canDeleteComment(viewer, { authorId: r.author_id }, { authorId: r.post_author_id }),
 })
 
-export function getCommentRecord(db: DB, id: number) {
-  return db.prepare(`${COMMENT_SELECT} WHERE c.id = ?`).get(id) as CommentRecord | undefined
+export function getCommentRecord(db: Queryable, id: number) {
+  return db.get<CommentRecord>(`${COMMENT_SELECT} WHERE c.id = ?`, [id])
 }
 
-export function getCommentView(db: DB, viewer: Viewer, id: number): CommentView | null {
-  const row = getCommentRecord(db, id)
+export async function getCommentView(db: Queryable, viewer: Viewer, id: number): Promise<CommentView | null> {
+  const row = await getCommentRecord(db, id)
   return row ? toCommentView(viewer, row) : null
 }
 
 /** Oldest first, so a conversation reads top to bottom. */
-export function listComments(db: DB, viewer: Viewer, postId: number, opts: { cursor?: string; limit: number }) {
+export async function listComments(db: Queryable, viewer: Viewer, postId: number, opts: { cursor?: string; limit: number }) {
   const params: (string | number)[] = [postId]
   let cursorSql = ''
   const cursor = decodeCursor(opts.cursor)
@@ -136,9 +138,10 @@ export function listComments(db: DB, viewer: Viewer, postId: number, opts: { cur
     cursorSql = 'AND (c.created_at, c.id) > (?, ?)'
     params.push(cursor.createdAt, cursor.id)
   }
-  const rows = db
-    .prepare(`${COMMENT_SELECT} WHERE c.post_id = ? ${cursorSql} ORDER BY c.created_at, c.id LIMIT ?`)
-    .all(...params, opts.limit + 1) as unknown as CommentRecord[]
+  const rows = await db.all<CommentRecord>(`${COMMENT_SELECT} WHERE c.post_id = ? ${cursorSql} ORDER BY c.created_at, c.id LIMIT ?`, [
+    ...params,
+    opts.limit + 1,
+  ])
   const hasMore = rows.length > opts.limit
   const page = rows.slice(0, opts.limit)
   const last = page.at(-1)

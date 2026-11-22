@@ -6,7 +6,7 @@
  */
 import { REACTIONS } from '../shared/schemas'
 import { NO_PASSWORD } from './auth'
-import { transaction, type DB } from './db'
+import { SETUP_LOCK, type DB, type Queryable } from './db'
 import { landscapePng } from './placeholder-images'
 
 function mulberry32(seed: number) {
@@ -80,61 +80,115 @@ const COMMENTS = [
 /** Posts with these indexes get a picture. */
 const WITH_IMAGE = new Set([3, 8, 13, 16, 23, 29, 35])
 
-export function seed(db: DB, now = new Date()) {
+/** One INSERT for many rows. Returns the generated ids in the same order. */
+async function insertMany(t: Queryable, table: string, cols: string[], rows: unknown[][], returning = true): Promise<number[]> {
+  if (!rows.length) return []
+  const values = rows.map((r) => `(${r.map(() => '?').join(', ')})`).join(', ')
+  const sql = `INSERT INTO ${table} (${cols.join(', ')}) VALUES ${values}${returning ? ' RETURNING id' : ' ON CONFLICT DO NOTHING'}`
+  const out = await t.all<{ id: number }>(sql, rows.flat())
+  return out.map((r) => r.id)
+}
+
+export async function seed(t: Queryable, now = new Date()) {
   const rand = mulberry32(42)
   const pick = <T>(list: readonly T[]) => list[Math.floor(rand() * list.length)]!
 
-  transaction(db, () => {
-    const userIds: number[] = []
-    PEOPLE.forEach((p, i) => {
-      const created = new Date(now.getTime() - (60 + i * 5) * 86_400_000).toISOString()
-      const { lastInsertRowid } = db
-        .prepare('INSERT INTO users (username, display_name, bio, password_hash, is_demo, created_at) VALUES (?, ?, ?, ?, 1, ?)')
-        .run(p.username, p.displayName, p.bio, NO_PASSWORD, created)
-      userIds.push(Number(lastInsertRowid))
-    })
+  const userIds = await insertMany(
+    t,
+    'users',
+    ['username', 'display_name', 'bio', 'password_hash', 'is_demo', 'created_at'],
+    PEOPLE.map((p, i) => [p.username, p.displayName, p.bio, NO_PASSWORD, true, new Date(now.getTime() - (60 + i * 5) * 86_400_000).toISOString()]),
+  )
 
-    const insertMedia = db.prepare('INSERT INTO media (owner_id, mime, bytes, size, created_at) VALUES (?, ?, ?, ?, ?)')
-    const insertPost = db.prepare('INSERT INTO posts (author_id, body, media_id, created_at, edited_at) VALUES (?, ?, ?, ?, ?)')
-    const insertComment = db.prepare('INSERT INTO comments (post_id, author_id, body, created_at) VALUES (?, ?, ?, ?)')
-    const insertReaction = db.prepare('INSERT OR IGNORE INTO reactions (post_id, user_id, type, created_at) VALUES (?, ?, ?, ?)')
+  // Work out every post, comment and reaction first, then write them in a few queries.
+  const total = POSTS.length
+  const posts: { authorId: number; body: string; image: number | null; created: Date; edited: string | null }[] = []
+  const comments: { post: number; author: number; body: string; when: string }[] = []
+  const reactions: { post: number; user: number; type: string; when: string }[] = []
+  POSTS.forEach((body, i) => {
+    const authorId = userIds[i % 3 === 0 ? 0 : Math.floor(rand() * userIds.length)]!
+    const created = new Date(now.getTime() - ((total - i) * 13 + Math.floor(rand() * 8)) * 3_600_000)
+    const edited = rand() < 0.1 ? new Date(created.getTime() + 20 * 60_000).toISOString() : null
+    posts.push({ authorId, body, image: WITH_IMAGE.has(i) ? i : null, created, edited })
+    const commentCount = Math.floor(rand() * rand() * 9)
+    for (let c = 0; c < commentCount; c++) {
+      const when = new Date(created.getTime() + (c + 1) * (15 + Math.floor(rand() * 90)) * 60_000)
+      if (when > now) break
+      comments.push({ post: i, author: pick(userIds), body: pick(COMMENTS), when: when.toISOString() })
+    }
+    for (const uid of userIds) {
+      if (uid !== authorId && rand() < 0.45) {
+        reactions.push({ post: i, user: uid, type: rand() < 0.6 ? 'like' : pick(REACTIONS), when: created.toISOString() })
+      }
+    }
+  })
 
-    // Oldest first, so ids grow with time like real data.
-    const total = POSTS.length
-    POSTS.forEach((body, i) => {
-      const authorId = userIds[i % 3 === 0 ? 0 : Math.floor(rand() * userIds.length)]!
-      const created = new Date(now.getTime() - ((total - i) * 13 + Math.floor(rand() * 8)) * 3_600_000)
-      let mediaId: number | null = null
-      if (WITH_IMAGE.has(i)) {
-        const png = landscapePng(i)
-        mediaId = Number(insertMedia.run(authorId, 'image/png', png, png.length, created.toISOString()).lastInsertRowid)
-      }
-      const edited = rand() < 0.1 ? new Date(created.getTime() + 20 * 60_000).toISOString() : null
-      const postId = Number(insertPost.run(authorId, body, mediaId, created.toISOString(), edited).lastInsertRowid)
+  const mediaIds = new Map<number, number>()
+  for (const p of posts) {
+    if (p.image === null) continue
+    const png = landscapePng(p.image)
+    const row = await t.get<{ id: number }>('INSERT INTO media (owner_id, mime, bytes, size, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id', [
+      p.authorId,
+      'image/png',
+      png,
+      png.length,
+      p.created.toISOString(),
+    ])
+    mediaIds.set(p.image, row!.id)
+  }
 
-      const commentCount = Math.floor(rand() * rand() * 9)
-      for (let c = 0; c < commentCount; c++) {
-        const when = new Date(created.getTime() + (c + 1) * (15 + Math.floor(rand() * 90)) * 60_000)
-        if (when > now) break
-        insertComment.run(postId, pick(userIds), pick(COMMENTS), when.toISOString())
-      }
-      for (const uid of userIds) {
-        if (uid !== authorId && rand() < 0.45) {
-          const type = rand() < 0.6 ? 'like' : pick(REACTIONS)
-          insertReaction.run(postId, uid, type, created.toISOString())
-        }
-      }
-    })
+  const postIds = await insertMany(
+    t,
+    'posts',
+    ['author_id', 'body', 'media_id', 'created_at', 'edited_at'],
+    posts.map((p) => [p.authorId, p.body, p.image === null ? null : mediaIds.get(p.image)!, p.created.toISOString(), p.edited]),
+  )
+  await insertMany(t, 'comments', ['post_id', 'author_id', 'body', 'created_at'], comments.map((c) => [postIds[c.post], c.author, c.body, c.when]))
+  await insertMany(t, 'reactions', ['post_id', 'user_id', 'type', 'created_at'], reactions.map((r) => [postIds[r.post], r.user, r.type, r.when]), false)
+  await t.run(`INSERT INTO app_meta (key, value) VALUES ('seeded_at', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`, [
+    new Date().toISOString(),
+  ])
+}
+
+const WIPE = 'TRUNCATE sessions, reactions, comments, posts, media, users, app_meta RESTART IDENTITY CASCADE'
+
+/** Seed an empty database. Safe when several servers start at once. */
+export async function ensureSeeded(db: DB) {
+  await db.tx(async (t) => {
+    await t.get('SELECT pg_advisory_xact_lock(?)', [SETUP_LOCK])
+    const row = await t.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM users')
+    if ((row?.n ?? 0) === 0) await seed(t)
   })
 }
 
-export function isEmpty(db: DB) {
-  return (db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n === 0
+/** Delete everything and seed again. */
+export async function resetDemo(db: DB) {
+  await db.tx(async (t) => {
+    await t.get('SELECT pg_advisory_xact_lock(?)', [SETUP_LOCK])
+    await t.exec(WIPE)
+    await seed(t)
+  })
 }
 
-export function resetDemo(db: DB) {
-  transaction(db, () => {
-    db.exec('DELETE FROM sessions; DELETE FROM reactions; DELETE FROM comments; DELETE FROM posts; UPDATE users SET avatar_media_id = NULL; DELETE FROM media; DELETE FROM users;')
-  })
-  seed(db)
+/**
+ * Reset the shared demo data once it is older than `hours`. Checked at most
+ * every 5 minutes per server, so it works on serverless hosts without a timer.
+ */
+export function demoResetter(db: DB, hours: number) {
+  let lastCheck = 0
+  return async () => {
+    if (hours <= 0 || Date.now() - lastCheck < 5 * 60_000) return
+    lastCheck = Date.now()
+    const maxAge = hours * 3_600_000
+    const stale = (value?: string) => !value || Date.now() - new Date(value).getTime() > maxAge
+    const meta = await db.get<{ value: string }>(`SELECT value FROM app_meta WHERE key = 'seeded_at'`)
+    if (!stale(meta?.value)) return
+    await db.tx(async (t) => {
+      await t.get('SELECT pg_advisory_xact_lock(?)', [SETUP_LOCK])
+      const again = await t.get<{ value: string }>(`SELECT value FROM app_meta WHERE key = 'seeded_at'`)
+      if (!stale(again?.value)) return
+      await t.exec(WIPE)
+      await seed(t)
+    })
+  }
 }

@@ -41,6 +41,11 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
     res.status(err.status).json({ error: { message: err.message, fieldErrors: err.fieldErrors } })
     return
   }
+  // Postgres unique violation: two requests raced to create the same thing.
+  if (err?.code === '23505') {
+    res.status(409).json({ error: { message: 'That already exists. Please refresh and try again.' } })
+    return
+  }
   // body-parser errors (bad JSON, body too large) carry a status
   const status = typeof err?.status === 'number' ? err.status : 500
   if (status >= 400 && status < 500) {

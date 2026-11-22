@@ -1,7 +1,7 @@
 import { Router, type RequestHandler } from 'express'
 import multer from 'multer'
 import { IMAGE_MAX_BYTES } from '../shared/schemas'
-import { nowIso, type DB } from './db'
+import { nowIso, type Queryable } from './db'
 import { badRequest, HttpError, notFound } from './http'
 
 export type ImageMime = 'image/jpeg' | 'image/png' | 'image/webp' | 'image/gif'
@@ -42,26 +42,26 @@ export function singleImage(field: string): RequestHandler {
   }
 }
 
-export function storeImage(db: DB, ownerId: number, file: Express.Multer.File): number {
+export async function storeImage(db: Queryable, ownerId: number, file: Express.Multer.File): Promise<number> {
   const mime = sniffImage(file.buffer)
   if (!mime) throw badRequest('That file is not a supported image.', { image: 'Use a JPG, PNG, WebP or GIF image.' })
-  const { lastInsertRowid } = db
-    .prepare('INSERT INTO media (owner_id, mime, bytes, size, created_at) VALUES (?, ?, ?, ?, ?)')
-    .run(ownerId, mime, file.buffer, file.size, nowIso())
-  return Number(lastInsertRowid)
+  const row = await db.get<{ id: number }>(
+    'INSERT INTO media (owner_id, mime, bytes, size, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id',
+    [ownerId, mime, file.buffer, file.size, nowIso()],
+  )
+  return row!.id
 }
 
-export function deleteMedia(db: DB, id: number | null) {
-  if (id) db.prepare('DELETE FROM media WHERE id = ?').run(id)
+export async function deleteMedia(db: Queryable, id: number | null) {
+  if (id) await db.run('DELETE FROM media WHERE id = ?', [id])
 }
 
-export function mediaRoutes(db: DB) {
+export function mediaRoutes(db: Queryable) {
   const router = Router()
-  const find = db.prepare('SELECT mime, bytes FROM media WHERE id = ?')
-  router.get('/:id', (req, res) => {
+  router.get('/:id', async (req, res) => {
     const id = Number(req.params.id)
     if (!Number.isInteger(id) || id <= 0) throw notFound('That image')
-    const row = find.get(id) as { mime: string; bytes: Uint8Array } | undefined
+    const row = await db.get<{ mime: string; bytes: Uint8Array }>('SELECT mime, bytes FROM media WHERE id = ?', [id])
     if (!row) throw new HttpError(404, 'That image was not found.')
     res.set({
       'Content-Type': row.mime,

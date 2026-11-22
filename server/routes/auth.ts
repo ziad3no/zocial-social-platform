@@ -14,54 +14,56 @@ import {
   verifyPassword,
   type UserRecord,
 } from '../auth'
-import { nowIso, transaction, type DB } from '../db'
+import { nowIso, type DB, type Queryable } from '../db'
 import { conflict, HttpError, notFound, parse } from '../http'
 import { deleteMedia, singleImage, storeImage } from '../media'
 
 export function authRoutes(db: DB, options: AppOptions) {
   const router = Router()
   const limiter = createLoginLimiter()
-  const byUsername = db.prepare('SELECT * FROM users WHERE username = ?')
+  const byUsername = (username: string) => db.get<UserRecord>('SELECT * FROM users WHERE username = ?', [username])
 
-  const startSession = (res: Response, userId: number) => setSessionCookie(res, createSession(db, userId), options.secureCookies)
+  const startSession = async (res: Response, userId: number) =>
+    setSessionCookie(res, await createSession(db, userId), options.secureCookies)
 
   router.post('/register', async (req, res) => {
     const input = parse(registerSchema, req.body)
-    if (byUsername.get(input.username)) {
+    if (await byUsername(input.username)) {
       throw conflict('That username is taken.', { username: 'That username is taken. Try another.' })
     }
-    const { lastInsertRowid } = db
-      .prepare('INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?)')
-      .run(input.username, input.displayName, await hashPassword(input.password), nowIso())
-    startSession(res, Number(lastInsertRowid))
-    res.status(201).json({ user: toSessionUser(byUsername.get(input.username) as unknown as UserRecord) })
+    const user = await db.get<UserRecord>(
+      'INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?) RETURNING *',
+      [input.username, input.displayName, await hashPassword(input.password), nowIso()],
+    )
+    await startSession(res, user!.id)
+    res.status(201).json({ user: toSessionUser(user!) })
   })
 
   router.post('/login', async (req, res) => {
     const input = parse(loginSchema, req.body)
     const key = `${req.ip}|${input.username}`
     limiter.check(key)
-    const user = byUsername.get(input.username) as UserRecord | undefined
+    const user = await byUsername(input.username)
     if (!user || !(await verifyPassword(input.password, user.password_hash))) {
       limiter.fail(key)
       throw new HttpError(401, 'Username or password is incorrect.')
     }
     limiter.reset(key)
-    startSession(res, user.id)
+    await startSession(res, user.id)
     res.json({ user: toSessionUser(user) })
   })
 
-  router.post('/demo', (req, res) => {
+  router.post('/demo', async (req, res) => {
     if (!options.demoLogin) throw notFound('Demo sign-in')
     const { username } = parse(demoLoginSchema, req.body)
-    const user = db.prepare('SELECT * FROM users WHERE username = ? AND is_demo = 1').get(username) as UserRecord | undefined
+    const user = await db.get<UserRecord>('SELECT * FROM users WHERE username = ? AND is_demo', [username])
     if (!user) throw notFound('That demo account')
-    startSession(res, user.id)
+    await startSession(res, user.id)
     res.json({ user: toSessionUser(user) })
   })
 
-  router.post('/logout', (req, res) => {
-    if (req.sessionHash) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(req.sessionHash)
+  router.post('/logout', async (req, res) => {
+    if (req.sessionHash) await db.run('DELETE FROM sessions WHERE token_hash = ?', [req.sessionHash])
     clearSessionCookie(res, options.secureCookies)
     res.status(204).end()
   })
@@ -77,32 +79,34 @@ export function authRoutes(db: DB, options: AppOptions) {
 export function meRoutes(db: DB) {
   const router = Router()
   router.use(requireAuth)
-  const reload = (id: number) => toSessionUser(db.prepare('SELECT * FROM users WHERE id = ?').get(id) as unknown as UserRecord)
+  const reload = async (id: number) => toSessionUser((await db.get<UserRecord>('SELECT * FROM users WHERE id = ?', [id]))!)
+  const currentAvatar = async (q: Queryable, id: number) =>
+    (await q.get<{ id: number | null }>('SELECT avatar_media_id AS id FROM users WHERE id = ?', [id]))?.id ?? null
 
-  router.patch('/', (req, res) => {
+  router.patch('/', async (req, res) => {
     const input = parse(profileSchema, req.body)
-    db.prepare('UPDATE users SET display_name = ?, bio = ? WHERE id = ?').run(input.displayName, input.bio, req.user!.id)
-    res.json({ user: reload(req.user!.id) })
+    await db.run('UPDATE users SET display_name = ?, bio = ? WHERE id = ?', [input.displayName, input.bio, req.user!.id])
+    res.json({ user: await reload(req.user!.id) })
   })
 
-  router.put('/avatar', singleImage('image'), (req, res) => {
+  router.put('/avatar', singleImage('image'), async (req, res) => {
     if (!req.file) throw new HttpError(400, 'Choose an image to upload.', { image: 'Choose an image to upload.' })
     const me = req.user!
-    transaction(db, () => {
-      const old = db.prepare('SELECT avatar_media_id AS id FROM users WHERE id = ?').get(me.id) as { id: number | null }
-      const mediaId = storeImage(db, me.id, req.file!)
-      db.prepare('UPDATE users SET avatar_media_id = ? WHERE id = ?').run(mediaId, me.id)
-      deleteMedia(db, old.id)
+    await db.tx(async (t) => {
+      const old = await currentAvatar(t, me.id)
+      const mediaId = await storeImage(t, me.id, req.file!)
+      await t.run('UPDATE users SET avatar_media_id = ? WHERE id = ?', [mediaId, me.id])
+      await deleteMedia(t, old)
     })
-    res.json({ user: reload(me.id) })
+    res.json({ user: await reload(me.id) })
   })
 
-  router.delete('/avatar', (req, res) => {
+  router.delete('/avatar', async (req, res) => {
     const me = req.user!
-    const old = db.prepare('SELECT avatar_media_id AS id FROM users WHERE id = ?').get(me.id) as { id: number | null }
-    db.prepare('UPDATE users SET avatar_media_id = NULL WHERE id = ?').run(me.id)
-    deleteMedia(db, old.id)
-    res.json({ user: reload(me.id) })
+    const old = await currentAvatar(db, me.id)
+    await db.run('UPDATE users SET avatar_media_id = NULL WHERE id = ?', [me.id])
+    await deleteMedia(db, old)
+    res.json({ user: await reload(me.id) })
   })
 
   return router
@@ -111,17 +115,23 @@ export function meRoutes(db: DB) {
 export function userRoutes(db: DB) {
   const router = Router()
   router.use(requireAuth)
-  router.get('/:username', (req, res) => {
-    const row = db
-      .prepare(
-        `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_media_id, u.created_at,
-                (SELECT COUNT(*) FROM posts p WHERE p.author_id = u.id) AS post_count,
-                (SELECT COUNT(*) FROM reactions r JOIN posts p ON p.id = r.post_id WHERE p.author_id = u.id) AS reactions_received
-         FROM users u WHERE u.username = ?`,
-      )
-      .get(String(req.params.username).toLowerCase()) as
-      | { id: number; username: string; display_name: string; bio: string; avatar_media_id: number | null; created_at: string; post_count: number; reactions_received: number }
-      | undefined
+  router.get('/:username', async (req, res) => {
+    const row = await db.get<{
+      id: number
+      username: string
+      display_name: string
+      bio: string
+      avatar_media_id: number | null
+      created_at: string
+      post_count: number
+      reactions_received: number
+    }>(
+      `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_media_id, u.created_at,
+              (SELECT COUNT(*)::int FROM posts p WHERE p.author_id = u.id) AS post_count,
+              (SELECT COUNT(*)::int FROM reactions r JOIN posts p ON p.id = r.post_id WHERE p.author_id = u.id) AS reactions_received
+       FROM users u WHERE u.username = ?`,
+      [String(req.params.username).toLowerCase()],
+    )
     if (!row) throw notFound('That profile')
     const profile: Profile = {
       id: row.id,

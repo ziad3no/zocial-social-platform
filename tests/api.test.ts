@@ -1,19 +1,27 @@
 import request from 'supertest'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { createApp } from '../server/app'
 import { openDb, type DB } from '../server/db'
 import { sniffImage } from '../server/media'
 import { landscapePng } from '../server/placeholder-images'
-import { seed } from '../server/seed'
+import { resetDemo } from '../server/seed'
 
 const H = { 'X-Requested-With': 'zocial' }
 
 let db: DB
 let app: ReturnType<typeof createApp>
 
-beforeEach(() => {
-  db = openDb(':memory:')
-  seed(db)
+// One in-memory Postgres (PGlite) for the file, wiped and re-seeded before each test.
+beforeAll(async () => {
+  db = await openDb()
+}, 60_000)
+
+afterAll(async () => {
+  await db.close()
+})
+
+beforeEach(async () => {
+  await resetDemo(db)
   app = createApp(db, { demoLogin: true, secureCookies: false })
 })
 
@@ -127,8 +135,8 @@ describe('posts', () => {
     await nour.put(`/api/posts/${created.id}/reaction`).set(H).send({ type: 'love' }).expect(200)
     await nour.post(`/api/posts/${created.id}/comments`).set(H).send({ body: 'note to self' }).expect(201)
     await nour.delete(`/api/posts/${created.id}`).set(H).expect(204)
-    expect((db.prepare('SELECT COUNT(*) AS n FROM comments WHERE post_id = ?').get(created.id) as { n: number }).n).toBe(0)
-    expect((db.prepare('SELECT COUNT(*) AS n FROM reactions WHERE post_id = ?').get(created.id) as { n: number }).n).toBe(0)
+    expect((await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM comments WHERE post_id = ?', [created.id]))?.n).toBe(0)
+    expect((await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM reactions WHERE post_id = ?', [created.id]))?.n).toBe(0)
   })
 })
 
@@ -162,7 +170,7 @@ describe('pagination', () => {
     } while (cursor && pages < 20)
     expect(pages).toBe(4)
     expect(new Set(seen).size).toBe(seen.length)
-    expect(seen.length).toBe((db.prepare('SELECT COUNT(*) AS n FROM posts').get() as { n: number }).n)
+    expect(seen.length).toBe((await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM posts'))?.n)
     expect([...seen].sort((a, b) => b - a)).toEqual(seen)
   })
 

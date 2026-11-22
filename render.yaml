@@ -1,0 +1,18 @@
+# One-click deploy on Render: New → Blueprint → pick this repository.
+services:
+  - type: web
+    name: zocial
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: DEMO_LOGIN
+        value: "true"
+      - key: DEMO_RESET_HOURS
+        value: "6"

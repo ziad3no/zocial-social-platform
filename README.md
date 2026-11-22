@@ -59,7 +59,7 @@ The app also follows the system dark mode.
 You need Node.js 22.13 or newer (24 recommended). There is no database server to install: Zocial uses the SQLite engine built into Node.
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/zocial-social-platform.git
+git clone https://github.com/ziad3no/zocial-social-platform.git
 cd zocial-social-platform
 npm install
 npm run dev

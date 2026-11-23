@@ -2,7 +2,7 @@
 
 Zocial is a full-stack social app for a small community. Members have profiles, write posts with an optional photo, react with one of five emoji, and talk in the comments. The server makes sure nobody can edit or delete someone else's content, and every list handles loading, empty and error states.
 
-- **Live demo:** [ADD: your Vercel URL, e.g. https://zocial.vercel.app]
+- **Live demo:** https://zocial.vercel.app (one-click demo accounts on the sign-in page)
 - **Demo video:** [ADD: YouTube or LinkedIn link]
 
 On the live demo, pick one of the **Try a demo account** members on the sign-in page. Sign in as two different members (one in a private window) to see the ownership rules in action.
